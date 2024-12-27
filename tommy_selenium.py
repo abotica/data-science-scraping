@@ -2,6 +2,8 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+import time
 
 import requests
 from bs4 import BeautifulSoup
@@ -11,20 +13,13 @@ import asyncpg
 from dotenv import load_dotenv
 
 
-# database insertion function
+# Database insertion function
 async def insert(name, price, image_url, store_name):
     # Load .env file
     load_dotenv()
-    # Get the connection string from the environment variable
     connection_string = os.getenv('DATABASE_URL')
-    # Create a connection pool
     pool = await asyncpg.create_pool(connection_string)
-    # Acquire a connection from the pool
     async with pool.acquire() as conn:
-        # Execute SQL commands to retrieve the current time and version from PostgreSQL
-        # time = await conn.fetchval('SELECT NOW();')
-        # version = await conn.fetchval('SELECT version();')
-        # Insert data into the table
         await conn.execute(
             """
             INSERT INTO products (name, price, image_url, store_name)
@@ -32,86 +27,85 @@ async def insert(name, price, image_url, store_name):
             """,
             name, price, image_url, store_name
         )
-        
-        # Retrieve data from the table to verify insertion
         table = await conn.fetch('SELECT * FROM products;')
-    # Close the pool
     await pool.close()
-    # Print the results
     print(table)
 
-
-# beautifulsoup init
-URL = "https://www.tommy.hr"
-categories = []
-categories_links = []
-categories_urls = []
-
-# selenium init
+# Initialize Selenium WebDriver
 driver = webdriver.Chrome()
 
+# BeautifulSoup init
+URL = "https://www.tommy.hr"
 r = requests.get(URL)
-
 soup = BeautifulSoup(r.content, 'lxml')
 
-table = soup.find("div", attrs={"class": "@container/categories"})
+# Find category links
+categories_container = soup.find("div", attrs={"class": "@container/categories"})
+categories = categories_container.find_all("a")
+categories_urls = [URL + category['href'] for category in categories]
 
-categories = table.find_all("a")
-
-for category in categories:
-    categories_links.append(category['href'])
-
-for links in categories_links:
-    categories_urls.append(URL + links)
-
-
+# Process each category
 for category_url in categories_urls:
-    page = requests.get(f'{category_url}').text
-    pageSoup = BeautifulSoup(page, 'lxml')
-
     driver.get(category_url)
-             
     page_number = 1
-    count = 0
+
     while True:
-        finalPage = requests.get(f'{category_url}?page={page_number}')
-        # print(f'{category_url}?page={page_number}')
-        if finalPage.status_code != 200:
-            # print(f"Page {page_number} does not exist. Exiting pagination.")
+        # Wait for the page to load and ensure products are visible
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'div[class="@container flex  flex-wrap -mx-1 xs:-mx-2.5"]'))
+            )
+        except Exception as e:
+            print(f"Timeout waiting for products on {category_url}: {e}")
             break
-        finalSoup = BeautifulSoup(finalPage.text, 'lxml')
-        allItems = finalSoup.find('div', class_ ='@container flex flex-wrap -mx-1 xs:-mx-2.5')
-        if not allItems:
+
+        # Parse the page with BeautifulSoup
+        page_soup = BeautifulSoup(driver.page_source, 'lxml')
+        all_items = page_soup.find('div', class_='@container flex flex-wrap -mx-1 xs:-mx-2.5')
+        if not all_items:
+            print(f"No items found on page {page_number} of {category_url}")
             break
-        articles = allItems.findAll('article')
+
+        # Extract product data
+        articles = all_items.find_all('article')
         if not articles:
             break
+
         for article in articles:
-            articleImageURL = article.find('img')['src']
-            
-            image_src = driver.find_element(By.CSS_SELECTOR, f'img[src="{articleImageURL}"]')
-            
-            
-            print(image_src.get_attribute('src'))
+            # Extract product details
+            image_element = article.find('img')
+            if not image_element:
+                continue
 
-             
-            articleImageURL = URL + articleImageURL
-            if articleImageURL:
-                articleTittleTag = article.find('h3', class_ ='mb-2 text-sm pr-2 font-normal text-gray-900 line-clamp-2 hover:underline cursor-pointer')
-                articleName = articleTittleTag.text
-                if articleTittleTag:        
-                    articlePrice = article.find('span', class_='mt-auto inline-block-block text-sm font-bold text-gray-900').text
-                    articlePrice = articlePrice[:-2]
-                    priceSplit = articlePrice.split(',')
-                    priceEuro = priceSplit[0]
-                    priceCent = priceSplit[1]
-                    articlePrice = float(f'{priceEuro}.{priceCent}')
-                    # print(articleName, articlePrice, articleImageURL, 'Tommy')
-                    # asyncio.run(insert(articleTittleTag, float(articlePrice), articleImageURL, 'Tommy'))
-                    count+=1
-        page_number+=1
-                         
-                                         
+            # Handle dynamic image loading
+            try:
+                image_element_web = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, f'//img[@src="{image_element["src"]}"]'))
+                )
+                actual_image_url = image_element_web.get_attribute('src')
+                print(actual_image_url)
+            except Exception as e:
+                print(f"Error loading image for article: {e}")
+                continue
 
+            title_tag = article.find('h3', class_='mb-2 text-sm pr-2 font-normal text-gray-900 line-clamp-2 hover:underline cursor-pointer')
+            if not title_tag:
+                continue
+            article_name = title_tag.text.strip()
+
+            price_tag = article.find('span', class_='mt-auto inline-block-block text-sm font-bold text-gray-900')
+            if not price_tag:
+                continue
+            article_price_raw = price_tag.text.strip()[:-2]
+            price_split = article_price_raw.split(',')
+            article_price = float(f"{price_split[0]}.{price_split[1]}")
+
+            # Insert into database
+            # asyncio.run(insert(article_name, article_price, actual_image_url, 'Tommy'))
+
+        # Move to the next page
+        page_number += 1
+        next_page_url = f"{category_url}?page={page_number}"
+        driver.get(next_page_url)
 
 driver.quit()
